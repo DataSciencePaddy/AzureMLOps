@@ -1,0 +1,65 @@
+$schema: https://azuremlschemas.azureedge.net/latest/pipelineJob.schema.json
+type: pipeline
+display_name: Training_and_eval_pipeline
+compute: azureml:cpu-cluster
+
+jobs:
+  prep_job:
+    type: command
+    code: ../prep
+    command: >-
+      python prep.py 
+      --raw_data ${{inputs.raw_data}}
+      --prep_data ${{outputs.prep_data}}
+    inputs:
+      raw_data:
+        type: uri_file
+        path: azureml:titanic_raw:1
+        mode: ro_mount
+    outputs:
+      prep_data:
+        type: uri_file
+        path: azureml://datastores/workspaceblobstore/paths/titanic_prep_data/titanic_prepped.csv
+        mode: rw_mount
+    environment:
+      conda_file: ../conda-yamls/pipeline_conda_env.yml
+      image: mcr.microsoft.com/azureml/openmpi3.1.2-ubuntu18.04:latest
+
+  train_job:
+    type: command
+    inputs:
+      prep_data: ${{parent.jobs.prep_job.outputs.prep_data}}
+    outputs:
+      model_output:
+        type: uri_folder
+        path: azureml://datastores/workspaceblobstore/paths/titanic_model_data/
+        mode: rw_mount
+      test_data: 
+        type: uri_folder
+        path: azureml://datastores/workspaceblobstore/paths/titanic_test_data/
+        mode: rw_mount
+    code: ../train
+    environment:
+      conda_file: ../conda-yamls/pipeline_conda_env.yml
+      image: mcr.microsoft.com/azureml/openmpi3.1.2-ubuntu18.04:latest
+    compute: azureml:cpu-cluster
+    command: >-
+      python train.py 
+      --prep_data ${{inputs.prep_data}} 
+      --model_output ${{outputs.model_output}}
+      --test_data ${{outputs.test_data}}
+  
+  eval_job:
+    type: command
+    inputs:
+      test_data: ${{parent.jobs.train_job.outputs.test_data}}
+      model_folder: ${{parent.jobs.train_job.outputs.model_output}}
+    code: ../eval
+    environment:
+      conda_file: ../conda-yamls/pipeline_conda_env.yml
+      image: mcr.microsoft.com/azureml/openmpi3.1.2-ubuntu18.04:latest
+    compute: azureml:cpu-cluster
+    command: >-
+      python evaluatemodel.py 
+      --test_data ${{inputs.test_data}} 
+      --model_folder ${{inputs.model_folder}}

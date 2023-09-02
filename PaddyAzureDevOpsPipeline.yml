@@ -1,0 +1,239 @@
+resources:
+  containers:
+  - container: paddymlops
+    image: mcr.microsoft.com/mlops/python:latest
+
+pr: none
+trigger:
+  branches:
+    include:
+    - main
+
+variables:
+- group: devops-variable-group-dev
+- group: devops-variable-group-qa
+- name: model_name
+  value: mmchapter9titanic
+
+- name: ENDPT_NAME
+  value: pxmmchapter9titanicendpoint
+    
+- name: DEV_ENDPT_NAME
+  value: pxmmchapter9titanicendpointdev 
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+- stage: 'DevRunPipline'
+  variables:
+  - group: devops-variable-group-dev
+  displayName: 'DevTrainingPipeline'
+  jobs:
+  - job: "TrainingPipeline"
+    steps:  
+      - task: AzureCLI@1
+        env:
+          wsName: $(wsName)
+          resourceGroup: $(resourceGroup)
+          location: $(location)
+        inputs:
+          azureSubscription: paddymlworkspacedev
+          scriptLocation: inlineScript
+          workingDirectory: '$(Build.SourcesDirectory)'
+          inlineScript: |
+            echo "files:"
+            ls
+            echo "before adding version:"
+            az version
+            az extension add -n ml -y
+            echo "after adding version:"
+            az version
+            echo "resourceGroup "$(resourceGroup)           
+            az configure --defaults group=$(resourceGroup) 
+            echo "wsName "$(wsName)
+            az configure --defaults workspace=$(wsName)
+            echo "location "$(location) 
+            az configure --defaults location=$(location)
+            echo "success"
+            az ml model list -w $(wsName) -g $(resourceGroup)  -n $(model_name) --query "[0].version" -o tsv
+            
+            if [[ -z "$(az ml model list -w $(wsName) -g $(resourceGroup)  -n $(model_name) --query '[0].version' -o tsv)" ]]; then 
+                echo "no model was found, set value to 0"
+                echo "##vso[task.setvariable variable=modelversion;isOutput=true]0"
+                echo "model does not yet exist in this environment, set the value of the model version to 0"
+                exit 0
+            else
+                echo "model was found"
+                echo "##vso[task.setvariable variable=modelversion;isOutput=true]$(az ml model list -w $(wsName) -g $(resourceGroup)  -n $(model_name) --query '[0].version' -o tsv)"
+                exit 0
+            fi
+        name: 'setversion'
+        displayName: 'Get Initial Model Version'
+
+      - task: Bash@3
+        inputs:
+          workingDirectory: '$(Build.SourcesDirectory)'
+          targetType: 'inline'
+          script: |
+            echo 'modelversion'
+            echo $(setversion.modelversion)
+            echo 'SourcesDirectory'
+            echo '$(Build.SourcesDirectory)'
+        displayName: 'Display Model Version'
+
+      - task: AzureCLI@1
+        timeoutInMinutes: 45
+        env:
+          wsName: $(wsName)
+          resourceGroup: $(resourceGroup)
+          location: $(location)
+        inputs:
+          azureSubscription: paddymlworkspacedev
+          scriptLocation: inlineScript
+          workingDirectory: '$(Build.SourcesDirectory)'
+          inlineScript: |
+            echo "initial model version"
+            echo $(setversion.modelversion)
+            echo "files"
+            ls
+            az ml job create --file 'pipeline/aml_train_and_eval_pipeline.yml' --stream --set settings.force_rerun=True
+            echo "completed Bash@3"
+        displayName: 'Training Pipeline'
+
+      - task: AzureCLI@1
+        env:
+          wsName: $(wsName)
+          subscriptionId: $(subscriptionId)
+          resourceGroup: $(resourceGroup)
+          location: $(location)
+        inputs:
+          azureSubscription: paddymlworkspacedev
+          scriptLocation: inlineScript
+          workingDirectory: '$(Build.SourcesDirectory)'
+          inlineScript: |
+            echo "files:"
+            ls
+            az version
+            az configure --defaults group=$(resourceGroup) workspace=$(wsName) location=$(location)
+            az ml model list -w $(wsName) -g $(resourceGroup)  -n $(model_name) --query "[0].version" -o tsv
+            echo "##vso[task.setvariable variable=finalmodelversion;isOutput=true]$(az ml model list -w $(wsName) -g $(resourceGroup)  -n $(model_name) --query '[0].version' -o tsv)"
+            echo "##vso[task.setvariable variable=devResourceGroup;isOutput=true]$(resourceGroup)"
+            echo "##vso[task.setvariable variable=devWsName;isOutput=true]$(wsName)"
+            echo "##vso[task.setvariable variable=devLocation;isOutput=true]$(location)"
+        name: 'setfinalversion'
+        displayName: 'Get Final Model Version'
+
+      - task: AzureCLI@1
+        env:
+          wsName: $(wsName)
+          subscriptionId: $(subscriptionId)
+          resourceGroup: $(resourceGroup)
+          location: $(location)
+        inputs:
+          azureSubscription: paddymlworkspacedev
+          scriptLocation: inlineScript
+          workingDirectory: '$(Build.SourcesDirectory)'
+          inlineScript: |
+            echo 'initial model version '$(setversion.modelversion)
+            echo 'final model version   '$(setfinalversion.finalmodelversion)
+            if [[ $(setversion.modelversion) == $(setfinalversion.finalmodelversion) ]]; then
+                echo "##vso[task.setvariable variable=runme;isOutput=true]false"
+                exit 0
+            else
+                echo "deploy updated model"
+                echo "##vso[task.setvariable variable=runme;isOutput=true]true"
+                az ml model download  -w $(wsName) -g $(resourceGroup)  -n $(model_name) -v $(setfinalversion.finalmodelversion)
+            fi
+        name: 'checkversions'
+        displayName: 'Check Versions'
+            
+      - task: AzureCLI@1
+        env:
+          wsName: $(wsName)
+          subscriptionId: $(subscriptionId)
+          resourceGroup: $(resourceGroup)
+          location: $(location)
+        inputs:
+          azureSubscription: paddymlworkspacedev
+          scriptLocation: inlineScript
+          workingDirectory: '$(Build.SourcesDirectory)'
+          inlineScript: |
+            echo "check versions"
+            echo $(checkversions.runme)
+
+
+      - task: AzureCLI@1
+        env:
+          wsName: $(wsName)
+          resourceGroup: $(resourceGroup)
+          location: $(location)
+        inputs:
+          azureSubscription: paddymlworkspacedev
+          scriptLocation: inlineScript
+          workingDirectory: '$(Build.SourcesDirectory)'
+          inlineScript: |
+            ls
+            set -e
+            echo 'final model version was:'$(setfinalversion.finalmodelversion)
+            export NEW_DEPLOYMENT_NAME=deployment`echo $(setfinalversion.finalmodelversion)`v`echo $(date +"%s")`
+ 
+            echo $NEW_DEPLOYMENT_NAME
+            echo $ENDPT_NAME
+            
+            az extension add -n ml -y
+            az version
+            az configure --defaults group=$(resourceGroup) workspace=$(wsName) location=$(location)
+
+            ENDPOINT_EXISTS=$(az ml online-endpoint list -g $(resourceGroup) -w $(wsName) -o tsv --query "[?name=='$DEV_ENDPT_NAME'][name]" |  wc -l)
+            if [[ ENDPOINT_EXISTS -ne 1 ]]; then
+                echo "endpoint does not exists"
+                az ml online-endpoint create --file 'deploy/create-endpoint-dev.yml' -g $(resourceGroup) -w $(wsName) -n $(DEV_ENDPT_NAME)
+                echo "creating online deployment"
+                az ml online-deployment create --name $NEW_DEPLOYMENT_NAME -f 'deploy/model_deployment-dev.yml' -g $(resourceGroup) -w $(wsName) 
+                echo "updating online endpoint tags"
+                az ml online-endpoint update -n $DEV_ENDPT_NAME --set tags.prod=$NEW_DEPLOYMENT_NAME  --traffic "$NEW_DEPLOYMENT_NAME=100" -g $(resourceGroup) -w $(wsName)
+                exit 0
+            else
+                echo "endpoint exists, get deployment that already exists "
+                PROD_DEPLOYMENT=$(az ml online-endpoint show -n $DEV_ENDPT_NAME -g $(resourceGroup) -w $(wsName) -o tsv --query "tags.prod")
+                echo $PROD_DEPLOYMENT
+                az ml online-deployment create -g $(resourceGroup) -w $(wsName) --name $NEW_DEPLOYMENT_NAME -f "deploy/model_deployment-dev.yml" 
+                #test online-deployment created with sample file.
+                echo "test new endpoint"
+                az ml online-endpoint invoke -n $DEV_ENDPT_NAME --deployment $NEW_DEPLOYMENT_NAME --request-file "deploy/request.json"
+            
+                echo "---------------------------------------------------------------------------"
+                echo "update tag and traffic "
+                az ml online-endpoint update -g $(resourceGroup) -w $(wsName) -n $DEV_ENDPT_NAME --set tags.prod=$NEW_DEPLOYMENT_NAME
+            
+                echo "---------------------------------------------------------------------------"
+                echo "set traffic for origin endpoint to 0 - should be updated, but for completeness"
+                az ml online-endpoint update -g $(resourceGroup) -w $(wsName) -n $DEV_ENDPT_NAME --traffic "$NEW_DEPLOYMENT_NAME=100 $PROD_DEPLOYMENT=0"  --set tags.prod=$NEW_DEPLOYMENT_NAME
+
+                echo "---------------------------------------------------------------------------"
+                echo "check online endpoints deployed"
+                az ml online-endpoint list --query "[].{Name:name}"  --output table --resource-group $(resourceGroup) --workspace-name $(wsName)
+                echo "delete old online endpoints deployed"
+                az ml online-deployment delete -g $(resourceGroup) -w $(wsName) --endpoint $DEV_ENDPT_NAME --name $PROD_DEPLOYMENT --yes --no-wait
+            fi   
+        name: 'deploydevmodel'
+        displayName: 'deploydevmodel'
+        condition: eq(variables['checkversions.runme'], 'true')
+            
+      - task: CopyFiles@2
+        condition: eq(variables['checkversions.runme'], 'true')
+        inputs:
+          sourceFolder: '$(Build.SourcesDirectory)'
+          Contents: |
+            **/deploy/**
+            **/deploy/request.json
+          targetFolder: '$(Build.ArtifactStagingDirectory)' 
+
+      - task: PublishBuildArtifacts@1
+        condition: eq(variables['checkversions.runme'], 'true')
+        displayName: 'Publish Artifact: drop'
+        inputs:
+          ArtifactName: 'drop'
+          publishLocation: 'Container'
+          PathtoPublish: '$(Build.ArtifactStagingDirectory)'    
