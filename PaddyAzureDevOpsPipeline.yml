@@ -143,6 +143,7 @@ stages:
             else
                 echo "deploy updated model"
                 echo "##vso[task.setvariable variable=runme;isOutput=true]true"
+                echo "set variable success"
                 az ml model download  -w $(wsName) -g $(resourceGroup)  -n $(model_name) -v $(setfinalversion.finalmodelversion)
             fi
         name: 'checkversions'
@@ -237,3 +238,124 @@ stages:
           ArtifactName: 'drop'
           publishLocation: 'Container'
           PathtoPublish: '$(Build.ArtifactStagingDirectory)'    
+      
+
+      
+- stage: 'QAPromoteModel'
+  dependsOn: DevRunPipline
+  condition: eq(dependencies.DevRunPipline.outputs['TrainingPipeline.checkversions.runme'], 'true')
+  variables:
+  - group: devops-variable-group-qa
+  displayName: 'QAPromoteModel'
+  jobs:
+  - deployment: "RegisterModelQA"
+    environment: qa
+    variables:
+      vardevResourceGroup: $[ stageDependencies.DevRunPipline.TrainingPipeline.outputs['setfinalversion.devResourceGroup'] ]
+      vardevWsName: $[ stageDependencies.DevRunPipline.TrainingPipeline.outputs['setfinalversion.devWsName'] ]
+      vardevLocation: $[ stageDependencies.DevRunPipline.TrainingPipeline.outputs['setfinalversion.devLocation'] ]
+      vardevModelVersion: $[ stageDependencies.DevRunPipline.TrainingPipeline.outputs['setfinalversion.finalmodelversion'] ]
+    strategy:
+      runOnce:    
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+          - task: PowerShell@2
+            inputs:
+              targetType: 'inline'
+              script: |
+                ls
+                ls '$(Pipeline.Workspace)/drop/'
+
+          - task: AzureCLI@1
+            env:
+              wsName: $(wsName)
+              resourceGroup: $(resourceGroup)
+              location: $(location)
+            inputs:
+              azureSubscription: paddymlworkspacedev
+              scriptLocation: inlineScript
+              workingDirectory: '$(Build.SourcesDirectory)'
+              inlineScript: |
+                  az extension add -n ml -y
+                  az version
+                  echo "model version"
+                  echo $(vardevModelVersion)
+                  az ml model list -w $(vardevWsName) -g $(vardevResourceGroup)  -n $(model_name) --query "[0].version" -o tsv
+                  az ml model download  -w $(vardevWsName) -g $(vardevResourceGroup)  -n $(model_name) -v $(vardevModelVersion)
+                  ls
+            name: 'downloadmodel'
+            displayName: 'downloadmodel'
+
+          - task: AzureCLI@1
+            env:
+              wsName: $(wsName)
+              resourceGroup: $(resourceGroup)
+              location: $(location)
+            inputs:
+              azureSubscription: paddymlworkspaceqa
+              scriptLocation: inlineScript
+              workingDirectory: '$(Build.SourcesDirectory)'
+              inlineScript: |
+                  echo "files:"
+                  ls
+                  echo "model version" $(vardevModelVersion)
+                  az configure --defaults group=$(resourceGroup) workspace=$(wsName) location=$(location)
+                  az ml model create --name $(model_name) -v $(vardevModelVersion) --path ./$(model_name)/$(model_name) --type mlflow_model -g $(resourceGroup) -w $(wsName)
+            name: 'registermodel'
+            displayName: 'registermodel'
+          - task: AzureCLI@1
+            env:
+              wsName: $(wsName)
+              resourceGroup: $(resourceGroup)
+              location: $(location)
+            inputs:
+              azureSubscription: paddymlworkspaceqa
+              scriptLocation: inlineScript
+              workingDirectory: '$(Build.SourcesDirectory)'
+              inlineScript: |
+                  echo 'final model version was:'$(vardevModelVersion)
+                  export NEW_DEPLOYMENT_NAME=deployment`echo $(vardevModelVersion)`v`echo $(date +"%s")`
+            
+                  echo $NEW_DEPLOYMENT_NAME
+                  echo $ENDPT_NAME
+
+                  az extension add -n ml -y
+                  az version
+
+                  ENDPOINT_EXISTS=$(az ml online-endpoint list -g $(resourceGroup) -w $(wsName) -o tsv --query "[?name=='$ENDPT_NAME'][name]" |  wc -l)
+                   if [[ ENDPOINT_EXISTS -ne 1 ]]; then
+                      echo "endpoint does not exists"
+                      az ml online-endpoint create --file '$(Pipeline.Workspace)/drop/Chapter09/src/deploy/create-endpoint.yml' -g $(resourceGroup) -w $(wsName)
+                      echo "creating online deployment"
+                      az ml online-deployment create --name $NEW_DEPLOYMENT_NAME -f '$(Pipeline.Workspace)/drop/Chapter09/src/deploy/model_deployment.yml' -g $(resourceGroup) -w $(wsName) 
+                      echo "updating online endpoint tags"
+                      az ml online-endpoint update -n $ENDPT_NAME --set tags.prod=$NEW_DEPLOYMENT_NAME  --traffic "$NEW_DEPLOYMENT_NAME=100" -g $(resourceGroup) -w $(wsName)
+                      exit 0
+                  else
+                      echo "endpoint exists, get deployment that already exists "
+                      PROD_DEPLOYMENT=$(az ml online-endpoint show -n $ENDPT_NAME -g $(resourceGroup) -w $(wsName) -o tsv --query "tags.prod")
+                      echo $PROD_DEPLOYMENT
+                      az ml online-deployment create -g $(resourceGroup) -w $(wsName) --name $NEW_DEPLOYMENT_NAME -f "$(Pipeline.Workspace)/drop/Chapter09/src/deploy/model_deployment.yml" 
+                      #test online-deployment created with sample file.
+                      echo "test new endpoint"
+                      az ml online-endpoint invoke -n $ENDPT_NAME --deployment $NEW_DEPLOYMENT_NAME --request-file "$(Pipeline.Workspace)/drop/Chapter09/data/request.json"
+ 
+                      echo "---------------------------------------------------------------------------"
+                      echo "update tag and traffic"
+                      az ml online-endpoint update -g $(resourceGroup) -w $(wsName) -n $ENDPT_NAME --set tags.prod=$NEW_DEPLOYMENT_NAME
+            
+                      echo "---------------------------------------------------------------------------"
+                      echo "set traffic for origin endpoint to 0 - should be updated, but for completeness"
+                      az ml online-endpoint update -g $(resourceGroup) -w $(wsName) -n $ENDPT_NAME --traffic "$NEW_DEPLOYMENT_NAME=100 $PROD_DEPLOYMENT=0"  --set tags.prod=$NEW_DEPLOYMENT_NAME
+
+                      echo "---------------------------------------------------------------------------"
+                      echo "check online endpoints deployed"
+                      az ml online-endpoint list --query "[].{Name:name}"  --output table --resource-group $(resourceGroup) --workspace-name $(wsName)
+                      echo "delete old online endpoints deployed"
+                      az ml online-deployment delete -g $(resourceGroup) -w $(wsName) --endpoint $ENDPT_NAME --name $PROD_DEPLOYMENT --yes --no-wait
+                
+                  fi   
+            name: 'deploymodel'
+            displayName: 'deploymodel'     
